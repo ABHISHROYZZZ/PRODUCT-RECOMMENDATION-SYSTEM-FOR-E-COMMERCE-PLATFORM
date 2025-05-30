@@ -1,0 +1,241 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import pandas as pd
+import numpy as np
+import threading
+import os
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
+from sklearn.neighbors import NearestNeighbors
+
+# Global variables
+df = None
+feature_vectors = None
+user_mapping = {}
+product_mapping = {}
+reverse_product_mapping = {}
+model = None
+product_user_matrix = None
+vectorizer = TfidfVectorizer()
+
+# Recommendation Functions
+def recommend_products(product_id, top_n=100):
+    try:
+        product_index = df[df['PRODUCT_ID'] == product_id].index[0]
+    except IndexError:
+        return []
+
+    input_sensor = df.loc[product_index, 'SENSOR']
+    df_filtered = df[df['SENSOR'] == 'SAR'].copy() if input_sensor == 'SAR' else df[df['SENSOR'] != 'SAR'].copy()
+    feature_vectors_filtered = vectorizer.transform(df_filtered['features'])
+
+    similarities = cosine_similarity(feature_vectors[product_index], feature_vectors_filtered)[0]
+
+    similarity_df = pd.DataFrame({
+        'PRODUCT_ID': df_filtered['PRODUCT_ID'].values,
+        'Similarity': similarities,
+        'Original_Index': df_filtered.index
+    })
+
+    similarity_df = similarity_df[similarity_df['PRODUCT_ID'] != product_id]
+    similarity_df = similarity_df.sort_values(by=['Similarity', 'Original_Index'], ascending=[False, True])
+
+    top_recommendations = similarity_df.head(top_n)
+    return list(zip(top_recommendations['PRODUCT_ID'], top_recommendations['Similarity']))
+
+def recommend_products_by_frequency(product_id, top_n=100):
+    product_id = product_id.strip()
+    if product_id not in product_mapping:
+        return []
+
+    idx = product_mapping[product_id]
+    is_input_sar = 'SAR' in df.loc[df['PRODUCT_ID'] == product_id, 'SENSOR'].values[0].upper()
+
+    distances, indices = model.kneighbors(product_user_matrix[idx], n_neighbors=min(top_n+1, product_user_matrix.shape[0]))
+    recommended_indices = indices[0][1:]
+    recommended_ids = [reverse_product_mapping[i] for i in recommended_indices]
+
+    filtered_ids = []
+    for pid in recommended_ids:
+        pid_sensor = df.loc[df['PRODUCT_ID'] == pid, 'SENSOR'].values
+        if len(pid_sensor) > 0:
+            is_pid_sar = 'SAR' in pid_sensor[0].upper()
+            if (is_input_sar and is_pid_sar) or (not is_input_sar and not is_pid_sar):
+                filtered_ids.append(pid)
+
+    freq = df['PRODUCT_ID'].value_counts().to_dict()
+    recs_with_freq = [(pid, freq.get(pid, 0)) for pid in filtered_ids]
+    recs_with_freq.sort(key=lambda x: x[1], reverse=True)
+
+    return recs_with_freq[:top_n]
+
+def hybrid_recommend(product_id, top_n=100, alpha=0.5):
+    if product_id not in product_mapping:
+        return []
+
+    idx = product_mapping[product_id]
+    input_sensor = df.loc[df['PRODUCT_ID'] == product_id, 'SENSOR'].values[0]
+    is_sar = input_sensor == 'SAR'
+    filtered_df = df[df['SENSOR'] == 'SAR'] if is_sar else df[df['SENSOR'] != 'SAR']
+    filtered_df = filtered_df.copy()
+    filtered_df['features'] = filtered_df[['SATELLITE', 'SENSOR', 'PRICED_CATEGORY']].astype(str).agg(' '.join, axis=1)
+
+    filtered_features = vectorizer.transform(filtered_df['features'])
+    content_sim = cosine_similarity(feature_vectors[idx], filtered_features)[0]
+    content_scores = dict(zip(filtered_df['PRODUCT_ID'], content_sim))
+
+    distances, indices = model.kneighbors(product_user_matrix[idx], n_neighbors=min(top_n+10, product_user_matrix.shape[0]))
+    collab_scores = {reverse_product_mapping[i]: 1 - d for i, d in zip(indices[0][1:], distances[0][1:])}
+
+    all_products = set(content_scores) | set(collab_scores)
+    combined = [
+        (pid, alpha * content_scores.get(pid, 0) + (1 - alpha) * collab_scores.get(pid, 0))
+        for pid in all_products if pid != product_id
+    ]
+
+    top_recs = sorted(combined, key=lambda x: x[1], reverse=True)[:top_n]
+    return top_recs
+
+# GUI Application
+class RecommendationApp:
+    def __init__(self, root):
+        self.root = root
+        self.df = None
+        self.root.title("🌟 Product Recommendation System")
+        self.root.geometry("700x800")
+        self.root.configure(bg="#f5f5f5")
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TButton", font=("Segoe UI", 10), padding=6)
+        style.configure("TLabel", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", font=("Segoe UI", 12, "bold"))
+
+        # --- Upload Section ---
+        upload_frame = ttk.LabelFrame(root, text="Upload CSV File", padding=(10, 10))
+        upload_frame.pack(fill="x", padx=20, pady=10)
+
+        self.file_label = ttk.Label(upload_frame, text="No file selected", foreground="blue")
+        self.file_label.pack(anchor="w", pady=5)
+
+        browse_btn = ttk.Button(upload_frame, text="Browse", command=self.browse_file)
+        browse_btn.pack(anchor="w")
+
+        self.status_label = ttk.Label(upload_frame, text="", foreground="green")
+        self.status_label.pack(anchor="w", pady=(5, 0))
+
+        self.remove_button = ttk.Button(upload_frame, text="Remove File", command=self.remove_file, state="disabled")
+        self.remove_button.pack(anchor="w", pady=5)
+
+        # --- Input Section ---
+        input_frame = ttk.LabelFrame(root, text="Input Details", padding=(10, 10))
+        input_frame.pack(fill="x", padx=20, pady=10)
+
+        ttk.Label(input_frame, text="Enter Product ID:", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
+        self.entry_product_id = ttk.Entry(input_frame, width=70)
+        self.entry_product_id.pack(anchor="w", pady=5)
+
+        ttk.Label(input_frame, text="Select Recommendation Type:", style="Header.TLabel").pack(anchor="w", pady=(10, 5))
+        self.combo_method = ttk.Combobox(input_frame, values=["Content-based", "Collaborative", "Hybrid"], state="readonly", width=47)
+        self.combo_method.current(0)
+        self.combo_method.pack(anchor="w", pady=5)
+
+        self.btn_recommend = ttk.Button(input_frame, text="🔍 Get Recommendations", command=self.get_recommendations, state="disabled")
+        self.btn_recommend.pack(pady=10)
+
+        # --- Output Section ---
+        output_frame = ttk.LabelFrame(root, text="Recommended Products", padding=(10, 10))
+        output_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        self.output_box = tk.Text(output_frame, height=25, wrap="word", font=("Segoe UI", 10))
+        self.output_box.pack(fill="both", expand=True)
+
+    def browse_file(self):
+        file_path = filedialog.askopenfilename(filetypes=[("CSV Files", "*.csv")])
+        if file_path:
+            self.load_file(file_path)
+
+    def load_file(self, file_path):
+        try:
+            self.df = pd.read_csv(file_path)
+            self.df.columns = self.df.columns.str.strip()
+            self.df['features'] = self.df[['SATELLITE', 'SENSOR', 'PRICED_CATEGORY']].astype(str).agg(' '.join, axis=1)
+            self.prepare_model()
+            self.status_label.config(text="File uploaded successfully.")
+            self.file_label.config(text=f"📄 {os.path.basename(file_path)}")
+            self.btn_recommend.config(state="normal")
+            self.remove_button.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("File Error", f"Failed to process file:\n{e}")
+
+    def remove_file(self):
+        self.df = None
+        self.file_label.config(text="No file selected")
+        self.status_label.config(text="File removed.")
+        self.output_box.delete('1.0', tk.END)
+        self.btn_recommend.config(state="disabled")
+        self.remove_button.config(state="disabled")
+
+    def prepare_model(self):
+        global df, feature_vectors, user_mapping, product_mapping, reverse_product_mapping, model, product_user_matrix
+        df = self.df
+        feature_vectors = vectorizer.fit_transform(df['features'])
+
+        user_mapping = {user: idx for idx, user in enumerate(df['USER_ID'].unique())}
+        product_mapping = {product: idx for idx, product in enumerate(df['PRODUCT_ID'].unique())}
+        reverse_product_mapping = {idx: product for product, idx in product_mapping.items()}
+
+        df['user_index'] = df['USER_ID'].map(user_mapping)
+        df['product_index'] = df['PRODUCT_ID'].map(product_mapping)
+
+        num_users = len(user_mapping)
+        num_products = len(product_mapping)
+
+        rows = df['product_index'].values
+        cols = df['user_index'].values
+        data = np.ones(len(df), dtype=np.uint8)
+
+        product_user_matrix = csr_matrix((data, (rows, cols)), shape=(num_products, num_users), dtype=np.float32)
+
+        model = NearestNeighbors(metric='cosine', algorithm='brute')
+        model.fit(product_user_matrix)
+
+    def get_recommendations(self):
+        product_id = self.entry_product_id.get().strip()
+        method = self.combo_method.get()
+
+        if not product_id:
+            messagebox.showwarning("Input Error", "Please enter a Product ID.")
+            return
+
+        self.output_box.delete('1.0', tk.END)
+        self.output_box.insert(tk.END, "Fetching recommendations...\n")
+
+        def run_recommendation():
+            try:
+                if method == "Content-based":
+                    results = recommend_products(product_id)
+                    display = [f"Product ID: {pid}    | Similarity: {score:.2f}" for pid, score in results]
+                elif method == "Collaborative":
+                    results = recommend_products_by_frequency(product_id)
+                    display = [f"Product ID: {pid}" for pid, freq in results]
+                elif method == "Hybrid":
+                    results = hybrid_recommend(product_id)
+                    display = [f"Product ID: {pid}    | Score: {score:.2f}" for pid, score in results]
+                else:
+                    display = ["Invalid recommendation type."]
+            except Exception as e:
+                display = [f"Error: {str(e)}"]
+
+            self.output_box.delete('1.0', tk.END)
+            self.output_box.insert(tk.END, "\n".join(display))
+
+        threading.Thread(target=run_recommendation, daemon=True).start()
+
+# Launch GUI
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RecommendationApp(root)
+    root.mainloop()
+
